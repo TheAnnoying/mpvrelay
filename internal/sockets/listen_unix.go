@@ -1,13 +1,11 @@
 //go:build !windows
 
-// Package sockets creates the listener side of whatever IPC transport
-// mpv.go's --input-ipc-server value implies: a Unix domain socket
-// everywhere real deployment happens (the stub always runs on the Linux
-// server inside Seanime's Docker container - see
-// internal/mediaplayers/mpvipc/pipe.go's dial("unix", path), which is
-// what Seanime dials against), or a Windows named pipe when building and
-// exercising cmd/mpv on a Windows dev machine for convenience (see
-// pipe_windows.go in the same Seanime package).
+// Package sockets creates the listener/dialer side of whatever IPC
+// transport mpv's --input-ipc-server value implies: a Unix domain socket
+// on Linux/macOS (see internal/mediaplayers/mpvipc/pipe.go's
+// dial("unix", path), which is what Seanime dials against), or a Windows
+// named pipe when either binary runs on Windows (see pipe_windows.go in
+// the same Seanime package).
 package sockets
 
 import (

@@ -1,8 +1,8 @@
-// Command mpv-agent runs persistently on the Windows desktop machine
-// that has a real screen and a real mpv.exe. It dials the server-side
+// Command mpv-agent runs persistently on the desktop machine (Windows or
+// Linux) that has a real screen and a real mpv. It dials the server-side
 // stub (cmd/mpv) over TCP, and on each playback session launches real
-// mpv.exe locally and tunnels its actual JSON-IPC named pipe back over
-// that same TCP connection - byte for byte, with zero interpretation of
+// mpv locally and tunnels its actual JSON-IPC socket/pipe back over that
+// same TCP connection - byte for byte, with zero interpretation of
 // the traffic. All content-aware rewriting (see internal/rewrite) lives
 // on the server side, which is the only side that knows the real library
 // paths, the server's own base URL and its auth secret; this binary only
@@ -24,7 +24,8 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"strconv"
+	"path/filepath"
+	"runtime"
 	"time"
 
 	"mpvrelay/internal/envcfg"
@@ -34,6 +35,16 @@ import (
 	"mpvrelay/internal/sockets"
 )
 
+// These aren't configurable - they're not tuning knobs a user should ever
+// need to reach for, just the fixed shape of "keep retrying, don't hang
+// forever on any one step."
+const (
+	retryInterval    = 500 * time.Millisecond
+	dialTimeout      = 3 * time.Second
+	pipeReadyTimeout = 10 * time.Second
+	handshakeTimeout = 10 * time.Second
+)
+
 func main() {
 	serverAddr := envcfg.Get(os.Getenv, "SEANIME_MPV_RELAY_SERVER", "")
 	if serverAddr == "" {
@@ -41,10 +52,6 @@ func main() {
 		os.Exit(1)
 	}
 	mpvPath := envcfg.Get(os.Getenv, "SEANIME_MPV_RELAY_MPV_PATH", "mpv")
-	retryInterval := durationEnv("SEANIME_MPV_RELAY_RETRY_INTERVAL", 500*time.Millisecond)
-	dialTimeout := durationEnv("SEANIME_MPV_RELAY_DIAL_TIMEOUT", 3*time.Second)
-	pipeReadyTimeout := durationEnv("SEANIME_MPV_RELAY_PIPE_TIMEOUT", 10*time.Second)
-	handshakeTimeout := durationEnv("SEANIME_MPV_RELAY_HANDSHAKE_TIMEOUT", 10*time.Second)
 
 	rlog.Printf("agent: starting; server=%s mpv=%s", serverAddr, mpvPath)
 
@@ -55,7 +62,7 @@ func main() {
 			continue
 		}
 		rlog.Printf("agent: connected to stub at %s", serverAddr)
-		runSession(conn, mpvPath, handshakeTimeout, pipeReadyTimeout)
+		runSession(conn, mpvPath)
 		rlog.Printf("agent: session ended, resuming retry loop")
 	}
 }
@@ -79,7 +86,7 @@ func main() {
 // to a session that already died. The deadline is cleared before the
 // relay loop below, which must tolerate arbitrarily long silence (e.g. a
 // paused video).
-func runSession(conn net.Conn, mpvPath string, handshakeTimeout, pipeReadyTimeout time.Duration) {
+func runSession(conn net.Conn, mpvPath string) {
 	defer conn.Close()
 
 	// One Reader/Writer pair for this conn's entire life - reused across
@@ -179,8 +186,16 @@ func startMpv(mpvPath, pipeName string, launch proto.Control) (*exec.Cmd, error)
 	return cmd, nil
 }
 
+// freshPipeName returns a path for a new, unique local IPC endpoint for
+// mpv's --input-ipc-server: a named pipe on Windows, a Unix domain socket
+// path everywhere else - whichever kind of endpoint the real mpv on this
+// machine will actually create.
 func freshPipeName() string {
-	return fmt.Sprintf(`\\.\pipe\mpvrelay_%d_%d`, os.Getpid(), time.Now().UnixNano())
+	id := fmt.Sprintf("mpvrelay_%d_%d", os.Getpid(), time.Now().UnixNano())
+	if runtime.GOOS == "windows" {
+		return `\\.\pipe\` + id
+	}
+	return filepath.Join(os.TempDir(), id+".sock")
 }
 
 // dialPipeWithRetry mirrors the retry shape of
@@ -267,20 +282,4 @@ func killMpv(cmd *exec.Cmd, mpvExited <-chan error) {
 	case <-time.After(3 * time.Second):
 		rlog.Printf("agent: mpv.exe did not exit within 3s of being killed")
 	}
-}
-
-func durationEnv(key string, def time.Duration) time.Duration {
-	raw := envcfg.Get(os.Getenv, key, "")
-	if raw == "" {
-		return def
-	}
-	if ms, convErr := strconv.Atoi(raw); convErr == nil {
-		return time.Duration(ms) * time.Millisecond
-	}
-	d, err := time.ParseDuration(raw)
-	if err != nil {
-		rlog.Printf("agent: invalid duration %q for %s, using default %s", raw, key, def)
-		return def
-	}
-	return d
 }

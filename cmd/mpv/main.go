@@ -1,23 +1,23 @@
 // Command mpv is a drop-in replacement for the real mpv binary, meant to
 // be placed on the PATH of (or configured as the media player path in)
-// the Seanime server running on a headless Linux box - typically inside
-// the same Docker container Seanime itself runs in.
+// a headless Seanime server - typically inside the same Docker container
+// Seanime itself runs in, on Linux or Windows.
 //
 // Seanime (internal/mediaplayers/mpv/mpv.go's launchPlayer/createCmd)
 // spawns this binary with an argv shaped like:
 //
-//	mpv [user-args...] --input-ipc-server=<unix-socket-path> [--log-file=<path>] <real-absolute-file-path>
+//	mpv [user-args...] --input-ipc-server=<socket-or-pipe-path> [--log-file=<path>] <real-absolute-file-path>
 //
-// and then dials <unix-socket-path> as a Unix domain socket
-// (internal/mediaplayers/mpvipc/pipe.go) to speak mpv's JSON-IPC
+// and then dials that path (a Unix domain socket on Linux, a named pipe on
+// Windows - see internal/mediaplayers/mpvipc) to speak mpv's JSON-IPC
 // protocol over it. This binary:
 //
-//  1. Creates that Unix socket itself and accepts Seanime's connection,
-//     so Seanime's side of the integration is completely unmodified: as
-//     far as it can tell, it dialed a real, running mpv.
+//  1. Creates that socket/pipe itself and accepts Seanime's connection, so
+//     Seanime's side of the integration is completely unmodified: as far
+//     as it can tell, it dialed a real, running mpv.
 //  2. Accepts a TCP connection from the client-side agent
-//     (cmd/mpv-agent), running on the Windows desktop machine that
-//     actually has a screen and real mpv, and tells it what to play.
+//     (cmd/mpv-agent), running on whichever machine actually has a screen
+//     and real mpv, and tells it what to play.
 //  3. Relays every JSON-IPC line between the two, verbatim, except for
 //     the narrow rewriting documented in internal/rewrite: the file path
 //     in "loadfile" commands (server -> client) becomes a URL, and the
@@ -45,6 +45,14 @@ import (
 	"mpvrelay/internal/rewrite"
 	"mpvrelay/internal/rlog"
 	"mpvrelay/internal/sockets"
+)
+
+// acceptTimeout and readyTimeout aren't configurable - they're not tuning
+// knobs a user should ever need to reach for, just the fixed shape of
+// "give up eventually instead of hanging forever."
+const (
+	acceptTimeout = 30 * time.Second
+	readyTimeout  = 15 * time.Second
 )
 
 func main() {
@@ -75,8 +83,6 @@ func run() error {
 	relayPort := envcfg.Get(os.Getenv, "SEANIME_MPV_RELAY_PORT", "43219")
 	serverBaseURL := envcfg.Get(os.Getenv, "SEANIME_MPV_RELAY_SEANIME_URL", "")
 	serverPassword := envcfg.Get(os.Getenv, "SEANIME_MPV_RELAY_PASSWORD", "")
-	acceptTimeout := durationEnv("SEANIME_MPV_RELAY_ACCEPT_TIMEOUT", 30*time.Second)
-	readyTimeout := durationEnv("SEANIME_MPV_RELAY_READY_TIMEOUT", 15*time.Second)
 
 	if mediaPath != "" && serverBaseURL == "" {
 		return fmt.Errorf("SEANIME_MPV_RELAY_SEANIME_URL is not set; cannot build a stream URL for %q", mediaPath)
@@ -214,7 +220,7 @@ func acceptBoth(ipcListener, tcpListener net.Listener, timeout time.Duration) (s
 				return nil, nil, fmt.Errorf("timed out after %s: agent connected but Seanime never dialed the IPC socket", timeout)
 			default:
 				return nil, nil, fmt.Errorf("timed out after %s: Seanime connected but no agent dialed in - "+
-					"is the agent running on the Windows machine, and can it reach this server's relay port?", timeout)
+					"is the agent running on the client machine, and can it reach this server's relay port?", timeout)
 			}
 		}
 	}
@@ -295,17 +301,4 @@ func relayAgentToSeanime(agentR *proto.Reader, seanimeConn net.Conn, rewriter *r
 			}
 		}
 	}
-}
-
-func durationEnv(key string, def time.Duration) time.Duration {
-	raw := envcfg.Get(os.Getenv, key, "")
-	if raw == "" {
-		return def
-	}
-	d, err := time.ParseDuration(raw)
-	if err != nil {
-		rlog.Printf("stub: invalid duration %q for %s, using default %s", raw, key, def)
-		return def
-	}
-	return d
 }

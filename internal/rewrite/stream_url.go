@@ -4,9 +4,9 @@
 // byte-for-byte; only two things need to be understood here:
 //
 //  1. When Seanime sends a "loadfile <realAbsolutePath> <mode>" command,
-//     the real, local filesystem path has to become a URL the Windows
-//     client's real mpv can actually fetch, since the client has no
-//     access whatsoever to the server's library filesystem (no share, no
+//     the real, local filesystem path has to become a URL the client's
+//     real mpv can actually fetch, since the client has no access
+//     whatsoever to the server's library filesystem (no share, no
 //     mapped drive). See BuildStreamURL.
 //
 //  2. Seanime's own local-file/library matching (see
@@ -136,7 +136,7 @@ func MintToken(serverPassword, endpoint string) (string, error) {
 // place of realAbsPath, pointing at the server's own mediastream/file
 // endpoint. serverBaseURL is the LAN-reachable base URL of the Seanime
 // server (e.g. "http://myserver.local:43211") - it must be reachable from
-// the Windows client, not just from inside the server's own container.
+// the client machine, not just from inside the server's own container.
 func BuildStreamURL(serverBaseURL, serverPassword, realAbsPath string) (string, error) {
 	base := strings.TrimRight(serverBaseURL, "/")
 	u, err := url.Parse(base + MediastreamPath)
