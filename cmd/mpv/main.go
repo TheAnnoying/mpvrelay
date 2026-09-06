@@ -1,55 +1,28 @@
-// Command mpv is a drop-in replacement for the real mpv binary, meant to
-// be placed on the PATH of (or configured as the media player path in)
-// a headless Seanime server - typically inside the same Docker container
-// Seanime itself runs in, on Linux or Windows.
-//
-// Seanime (internal/mediaplayers/mpv/mpv.go's launchPlayer/createCmd)
-// spawns this binary with an argv shaped like:
-//
-//	mpv [user-args...] --input-ipc-server=<socket-or-pipe-path> [--log-file=<path>] <real-absolute-file-path>
-//
-// and then dials that path (a Unix domain socket on Linux, a named pipe on
-// Windows - see internal/mediaplayers/mpvipc) to speak mpv's JSON-IPC
-// protocol over it. This binary:
-//
-//  1. Creates that socket/pipe itself and accepts Seanime's connection, so
-//     Seanime's side of the integration is completely unmodified: as far
-//     as it can tell, it dialed a real, running mpv.
-//  2. Accepts a TCP connection from the client-side agent
-//     (cmd/mpv-agent), running on whichever machine actually has a screen
-//     and real mpv, and tells it what to play.
-//  3. Relays every JSON-IPC line between the two, verbatim, except for
-//     the narrow rewriting documented in internal/rewrite: the file path
-//     in "loadfile" commands (server -> client) becomes a URL, and the
-//     "path"/"filename" property-change events reporting that URL back
-//     (client -> server) are translated back to the original real path.
-//     No other command or property this doesn't specifically name is
-//     ever inspected, let alone modified.
-//
-// See ../../README.md for deployment: PATH/settings wiring, required
-// environment variables and the Docker port that needs publishing.
+// Command mpv is a drop-in replacement for the real mpv binary, run on
+// the headless Seanime server. It creates the IPC socket/pipe Seanime
+// dials, accepts a TCP connection from cmd/mpv-agent on the client
+// machine, and relays JSON-IPC lines between them verbatim except for
+// the rewriting in internal/rewrite. See ../../README.md for deployment.
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strings"
 	"time"
 
 	"mpvrelay/internal/envcfg"
-	"mpvrelay/internal/ipcline"
 	"mpvrelay/internal/proto"
 	"mpvrelay/internal/rewrite"
 	"mpvrelay/internal/rlog"
 	"mpvrelay/internal/sockets"
 )
 
-// acceptTimeout and readyTimeout aren't configurable - they're not tuning
-// knobs a user should ever need to reach for, just the fixed shape of
-// "give up eventually instead of hanging forever."
 const (
 	acceptTimeout = 30 * time.Second
 	readyTimeout  = 15 * time.Second
@@ -68,23 +41,23 @@ func run() error {
 	rlog.Printf("stub: launched with argv=%q", args)
 	rlog.Printf("stub: ipcSocket=%q mediaPath=%q passthroughArgs=%q", ipcSocketPath, mediaPath, passthroughArgs)
 
-	// Seanime's launchPlayer waits for up to ~2s for a non-"AV:" line of
-	// stdout output before proceeding (and then, unconditionally, one
-	// more full second) - see internal/mediaplayers/mpv/mpv.go. Emitting
-	// this immediately, before doing anything else, keeps that wait as
-	// short as mpv's own startup chatter would.
+	// Seanime's launcher waits for a line of stdout before proceeding.
 	fmt.Println("mpvrelay-stub: starting")
 
 	if ipcSocketPath == "" {
 		return errors.New("no --input-ipc-server=<path> argument in argv; " +
 			"this binary is only meant to be launched by Seanime, not run by hand")
 	}
+	if mediaPath == "" {
+		return errors.New("no media file path in argv; " +
+			"this binary is only meant to be launched by Seanime, not run by hand")
+	}
 
-	relayPort := envcfg.Get(os.Getenv, "SEANIME_MPV_RELAY_PORT", "43219")
-	serverBaseURL := envcfg.Get(os.Getenv, "SEANIME_MPV_RELAY_SEANIME_URL", "")
-	serverPassword := envcfg.Get(os.Getenv, "SEANIME_MPV_RELAY_PASSWORD", "")
+	relayPort := envcfg.Get("SEANIME_MPV_RELAY_PORT", "43219")
+	serverBaseURL := envcfg.Get("SEANIME_MPV_RELAY_SEANIME_URL", "")
+	serverPassword := envcfg.Get("SEANIME_MPV_RELAY_PASSWORD", "")
 
-	if mediaPath != "" && serverBaseURL == "" {
+	if serverBaseURL == "" {
 		return fmt.Errorf("SEANIME_MPV_RELAY_SEANIME_URL is not set; cannot build a stream URL for %q", mediaPath)
 	}
 
@@ -109,10 +82,7 @@ func run() error {
 	defer seanimeConn.Close()
 	defer agentConn.Close()
 
-	// Exactly one Reader/Writer pair for agentConn's entire lifetime -
-	// reused across the handshake below and the relay loop later. See
-	// internal/proto's package doc for why a second Reader on the same
-	// conn would silently drop buffered bytes.
+	// One Reader/Writer pair for agentConn's whole life - see internal/proto.
 	agentR := proto.NewReader(agentConn)
 	agentW := proto.NewWriter(agentConn)
 
@@ -120,16 +90,14 @@ func run() error {
 		return fmt.Errorf("sending hello to agent: %w", err)
 	}
 
-	launch := proto.Control{Kind: proto.KindLaunch, Args: passthroughArgs}
-	if mediaPath != "" {
-		streamURL, err := rewrite.BuildStreamURL(serverBaseURL, serverPassword, mediaPath)
-		if err != nil {
-			return fmt.Errorf("building stream URL for %q: %w", mediaPath, err)
-		}
-		launch.URL = streamURL
-		rlog.Printf("stub: built stream URL for real mpv to open")
+	streamURL, err := rewrite.BuildStreamURL(serverBaseURL, serverPassword, mediaPath)
+	if err != nil {
+		return fmt.Errorf("building stream URL for %q: %w", mediaPath, err)
 	}
-	rlog.Printf("stub: sending launch to agent (hasURL=%v, %d passthrough args)", launch.URL != "", len(launch.Args))
+	rlog.Printf("stub: built stream URL for real mpv to open")
+
+	launch := proto.Control{Kind: proto.KindLaunch, Args: passthroughArgs, URL: streamURL}
+	rlog.Printf("stub: sending launch to agent (%d passthrough args)", len(launch.Args))
 	if err := agentW.WriteControl(launch); err != nil {
 		return fmt.Errorf("sending launch to agent: %w", err)
 	}
@@ -150,12 +118,8 @@ func run() error {
 	return nil
 }
 
-// parseArgv splits Seanime's argv into the three things this binary
-// cares about. createCmd (internal/mediaplayers/mpv/mpv.go) always
-// appends the file path last, after every flag (its own, and any
-// user-configured "Additional mpv arguments"), so "the last argument,
-// if it isn't itself a flag" is a reliable way to identify it without
-// having to enumerate every possible mpv flag shape.
+// parseArgv splits Seanime's argv: the file path is always the last
+// argument that isn't itself a flag.
 func parseArgv(args []string) (ipcSocketPath, mediaPath string, passthrough []string) {
 	n := len(args)
 	lastIsPath := n > 0 && !strings.HasPrefix(args[n-1], "-")
@@ -166,9 +130,7 @@ func parseArgv(args []string) (ipcSocketPath, mediaPath string, passthrough []st
 			ipcSocketPath = strings.TrimPrefix(a, "--input-ipc-server=")
 			continue
 		case strings.HasPrefix(a, "--log-file="):
-			// A server-local temp path (os.CreateTemp), meaningless
-			// forwarded to the client's own real mpv.
-			continue
+			continue // server-local temp path, meaningless on the client
 		case lastIsPath && i == n-1:
 			mediaPath = a
 			continue
@@ -183,14 +145,8 @@ type acceptResult struct {
 	err  error
 }
 
-// acceptBoth waits for both Seanime (over the IPC socket) and the agent
-// (over TCP) to connect, in whichever order they happen to arrive in.
-// The agent is expected to already be running and retrying its
-// connection before this process even starts (see cmd/mpv-agent and the
-// README) - the fixed TCP port means its very next retry succeeds within
-// one retry interval of this listener coming up, which happens within
-// milliseconds of process start, well before Seanime's own dial of the
-// IPC socket even has a chance to occur.
+// acceptBoth waits for Seanime (IPC socket) and the agent (TCP) to both
+// connect, in whichever order they arrive in.
 func acceptBoth(ipcListener, tcpListener net.Listener, timeout time.Duration) (seanimeConn, agentConn net.Conn, err error) {
 	ipcCh := make(chan acceptResult, 1)
 	agentCh := make(chan acceptResult, 1)
@@ -227,14 +183,9 @@ func acceptBoth(ipcListener, tcpListener net.Listener, timeout time.Duration) (s
 	return seanimeConn, agentConn, nil
 }
 
-// waitForReady blocks (briefly) for the agent to confirm its local real
-// mpv is up and its own relay loop has started. This is not required for
-// correctness - IPC lines Seanime sends before the agent is ready are
-// simply relayed a moment later, since TCP buffers them - but it gives
-// the timing instrumentation a clean point to report against, and lets
-// an early, unambiguous agent-side error (e.g. "mpv.exe not found")
-// surface immediately instead of only showing up as a mysterious later
-// timeout on Seanime's side.
+// waitForReady blocks briefly for the agent to confirm its mpv is ready,
+// mainly so an early agent-side error surfaces immediately instead of as
+// a later timeout on Seanime's side.
 func waitForReady(agentConn net.Conn, agentR *proto.Reader, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	_ = agentConn.SetReadDeadline(deadline)
@@ -253,27 +204,24 @@ func waitForReady(agentConn net.Conn, agentR *proto.Reader, timeout time.Duratio
 		case proto.KindError:
 			rlog.Printf("stub: agent reported an error while starting up: %s", c.Message)
 			return
-		default:
-			// Unexpected control message this early; keep waiting for
-			// ready/error up to the deadline.
 		}
 	}
 }
 
 func relaySeanimeToAgent(seanimeConn net.Conn, agentW *proto.Writer, rewriter *rewrite.IPCRewriter, errCh chan<- error) {
-	lines := ipcline.NewReader(seanimeConn)
-	for {
-		line, err := lines.ReadLine()
-		if err != nil {
-			errCh <- fmt.Errorf("Seanime->agent: reading from Seanime: %w", err)
-			return
-		}
-		rewritten := rewriter.RewriteOutgoing(line)
+	scanner := bufio.NewScanner(seanimeConn)
+	for scanner.Scan() {
+		rewritten := rewriter.RewriteOutgoing(scanner.Bytes())
 		if err := agentW.WriteIPCLine(rewritten); err != nil {
 			errCh <- fmt.Errorf("Seanime->agent: writing to agent: %w", err)
 			return
 		}
 	}
+	err := scanner.Err()
+	if err == nil {
+		err = io.EOF
+	}
+	errCh <- fmt.Errorf("Seanime->agent: reading from Seanime: %w", err)
 }
 
 func relayAgentToSeanime(agentR *proto.Reader, seanimeConn net.Conn, rewriter *rewrite.IPCRewriter, errCh chan<- error) {

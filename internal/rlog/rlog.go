@@ -1,11 +1,5 @@
-// Package rlog is a minimal timestamped logger.
-//
-// Everything is written to stderr so that stdout stays free for the "mpv"
-// stub to emit the startup chatter Seanime's launcher scans for (see
-// cmd/mpv). Timestamps use millisecond resolution because the timing budget
-// this whole system lives inside of is measured in single-digit seconds
-// (see internal/rewrite doc comment) — second-resolution timestamps would
-// hide exactly the latency this logger exists to diagnose.
+// Package rlog is a minimal timestamped logger, writing to stderr only
+// so stdout stays free for cmd/mpv's Seanime-scanned startup line.
 package rlog
 
 import (
@@ -16,11 +10,8 @@ import (
 
 var start = time.Now()
 
-// Printf writes a timestamped line to stderr. The timestamp is both a
-// wall-clock time (for correlating stub and agent logs, which run on
-// different machines with their own clocks) and a "+Nms since process
-// start" offset (for reasoning about the latency budget on a single
-// machine without doing clock arithmetic by hand).
+// Printf logs a wall-clock time (to correlate stub/agent logs across
+// machines) plus a "+Nms since start" offset (to reason about latency).
 func Printf(format string, args ...any) {
 	now := time.Now()
 	prefix := fmt.Sprintf("%s (+%6dms) ", now.Format("15:04:05.000"), now.Sub(start).Milliseconds())

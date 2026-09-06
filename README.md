@@ -102,14 +102,12 @@ GOOS=linux   GOARCH=amd64 go build -o dist/mpv-agent     ./cmd/mpv-agent
 Only build the pair that matches your actual setup — you don't need all
 four.
 
-Run `go test ./...` from this directory to run the unit tests, including
-an isolated `net.Pipe()` regression test for a `bufio.Reader` pitfall
-that caused real data loss during development (see
-`internal/proto/proto_netpipe_test.go`): building a second `bufio.Reader`
-on a connection that already had one silently drops whatever the first
-reader had buffered past the point it stopped reading at. Every reader in
-this codebase is created exactly once per connection and reused for that
-connection's whole life — that test exists to keep it that way.
+There are no automated tests. Every reader (`bufio.Reader`/`bufio.Scanner`)
+in this codebase must be created exactly once per connection and reused
+for that connection's whole life — building a second one on a connection
+that already had one silently drops whatever the first had buffered past
+the point it stopped reading at. This caused real data loss earlier in
+development; keep it in mind when touching connection-handling code.
 
 ## Deploying the server-side stub
 

@@ -1,34 +1,12 @@
-// Package proto implements the single-TCP-connection framing used between
-// the server-side "mpv" stub and the client-side agent.
+// Package proto frames the single TCP connection between the "mpv" stub
+// and the agent: [1 byte type][4 bytes big-endian length][payload].
+// TypeControl carries a JSON Control handshake message; TypeIPCLine
+// carries one raw mpv JSON-IPC line, without its trailing newline.
 //
-// Every frame is:
-//
-//	[1 byte type][4 bytes big-endian length][length bytes of payload]
-//
-// Two frame types share the connection:
-//
-//   - TypeControl: a JSON-encoded Control message (session handshake:
-//     "launch a player", "player is ready", "player exited", ...).
-//   - TypeIPCLine: the raw bytes of exactly one line of mpv's JSON-IPC
-//     protocol (i.e. one JSON value), without the trailing newline.
-//     Framing the line explicitly means neither side needs to re-scan for
-//     newlines downstream, and it sidesteps having to reimplement mpv's
-//     line-delimited protocol as a byte-stream: each frame is forwarded
-//     as an atomic, already-delimited unit.
-//
-// A single connection carries one playback session: the stub opens it
-// once an agent dials in and a "launch" has been acknowledged with
-// "ready", and either side tears it down when the session ends (real mpv
-// exiting on the client, or Seanime closing its socket on the server).
-//
-// IMPORTANT (see package-level doc in cmd/mpv): callers must construct
-// exactly one Reader per net.Conn and keep using it for that connection's
-// entire lifetime. Reader wraps a bufio.Reader, and bufio.Reader reads
-// whole chunks from the underlying conn, not just up to a frame boundary.
-// Discarding a Reader and building a second one on the same net.Conn
-// silently drops whatever the first one had already buffered past the
-// last frame it returned. See proto_netpipe_test.go for a regression test
-// that fails if this pattern is violated.
+// Exactly one Reader must be constructed per net.Conn and reused for
+// that connection's whole life - bufio.Reader buffers ahead of frame
+// boundaries, so a second Reader on the same conn silently drops
+// whatever bytes the first had already buffered.
 package proto
 
 import (
@@ -47,10 +25,8 @@ const (
 	TypeIPCLine FrameType = 0x02
 )
 
-// MaxFrameLen bounds a single frame's payload. mpv IPC lines are always
-// small (property values, short commands); this is generous headroom
-// while still catching a desynced stream quickly instead of trying to
-// allocate gigabytes for it.
+// MaxFrameLen bounds a single frame's payload, catching a desynced stream
+// quickly instead of allocating unbounded memory for it.
 const MaxFrameLen = 16 << 20 // 16 MiB
 
 // Kind enumerates Control.Kind values.
@@ -69,22 +45,16 @@ type Control struct {
 	Kind Kind `json:"kind"`
 
 	// URL is the mediastream URL for the file to load (KindLaunch only).
-	// Empty means "start mpv idle, no file yet" (mirrors mpv.go's unused
-	// --idle launch path, kept here for completeness/robustness).
 	URL string `json:"url,omitempty"`
 
 	// Args are extra mpv CLI flags to forward verbatim (KindLaunch only).
-	// The stub has already stripped --input-ipc-server, --log-file and
-	// the trailing file path from the original argv — see cmd/mpv.
 	Args []string `json:"args,omitempty"`
 
 	// Message is a human-readable detail for KindError/KindBye.
 	Message string `json:"message,omitempty"`
 }
 
-// Writer serializes frames onto a connection. It is safe for concurrent
-// use by multiple goroutines (the relay loops in each direction write to
-// the same connection independently).
+// Writer serializes frames onto a connection. Safe for concurrent use.
 type Writer struct {
 	mu sync.Mutex
 	w  io.Writer
@@ -134,9 +104,8 @@ type Frame struct {
 	Payload []byte // for TypeControl, the raw JSON; for TypeIPCLine, the raw line
 }
 
-// Reader deserializes frames from a connection. Exactly one Reader must
-// be created per connection and reused for that connection's whole
-// lifetime (see package doc).
+// Reader deserializes frames from a connection (see package doc: exactly
+// one per connection, reused for its whole lifetime).
 type Reader struct {
 	r *bufio.Reader
 }

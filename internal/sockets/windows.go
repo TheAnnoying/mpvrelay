@@ -5,13 +5,18 @@ package sockets
 import (
 	"fmt"
 	"net"
+	"time"
 
 	winio "github.com/Microsoft/go-winio"
 )
 
-// Listen creates the listener Seanime will dial as the mpv IPC socket,
-// for when the stub runs on a Windows Seanime host (see listen_unix.go
-// for the Linux/macOS equivalent).
+// Dial connects to a local named pipe, e.g. the one real mpv creates for
+// --input-ipc-server.
+func Dial(path string, timeout time.Duration) (net.Conn, error) {
+	return winio.DialPipe(path, &timeout)
+}
+
+// Listen creates the listener Seanime will dial as the mpv IPC pipe.
 func Listen(path string) (net.Listener, error) {
 	l, err := winio.ListenPipe(path, nil)
 	if err != nil {

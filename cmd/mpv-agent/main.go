@@ -1,26 +1,16 @@
-// Command mpv-agent runs persistently on the desktop machine (Windows or
-// Linux) that has a real screen and a real mpv. It dials the server-side
-// stub (cmd/mpv) over TCP, and on each playback session launches real
-// mpv locally and tunnels its actual JSON-IPC socket/pipe back over that
-// same TCP connection - byte for byte, with zero interpretation of
-// the traffic. All content-aware rewriting (see internal/rewrite) lives
-// on the server side, which is the only side that knows the real library
-// paths, the server's own base URL and its auth secret; this binary only
-// ever deals in opaque IPC lines.
-//
-// It is meant to already be running - e.g. as a scheduled task or a
-// background process started at login - and idly retrying its
-// connection well before any playback session starts, so that once
-// Seanime spawns cmd/mpv on the server and that binary starts listening,
-// this agent's very next retry (a fraction of a second later, not a
-// fresh process launch) is what completes the handshake. See
-// ../../README.md for the exact env vars and the cmd.exe quoting pitfall
-// they need to avoid.
+// Command mpv-agent runs persistently on the client machine that has a
+// real screen and real mpv. It dials the server-side stub (cmd/mpv) over
+// TCP, and on each session launches real mpv locally and tunnels its
+// IPC socket/pipe back over that connection - byte for byte, with zero
+// interpretation of the traffic (see internal/rewrite for why that lives
+// only on the server side). See ../../README.md for env vars.
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -29,15 +19,11 @@ import (
 	"time"
 
 	"mpvrelay/internal/envcfg"
-	"mpvrelay/internal/ipcline"
 	"mpvrelay/internal/proto"
 	"mpvrelay/internal/rlog"
 	"mpvrelay/internal/sockets"
 )
 
-// These aren't configurable - they're not tuning knobs a user should ever
-// need to reach for, just the fixed shape of "keep retrying, don't hang
-// forever on any one step."
 const (
 	retryInterval    = 500 * time.Millisecond
 	dialTimeout      = 3 * time.Second
@@ -46,12 +32,12 @@ const (
 )
 
 func main() {
-	serverAddr := envcfg.Get(os.Getenv, "SEANIME_MPV_RELAY_SERVER", "")
+	serverAddr := envcfg.Get("SEANIME_MPV_RELAY_SERVER", "")
 	if serverAddr == "" {
 		rlog.Printf("agent: fatal: SEANIME_MPV_RELAY_SERVER is not set (expected host:port, e.g. myserver.local:43219)")
 		os.Exit(1)
 	}
-	mpvPath := envcfg.Get(os.Getenv, "SEANIME_MPV_RELAY_MPV_PATH", "mpv")
+	mpvPath := envcfg.Get("SEANIME_MPV_RELAY_MPV_PATH", "mpv")
 
 	rlog.Printf("agent: starting; server=%s mpv=%s", serverAddr, mpvPath)
 
@@ -67,32 +53,13 @@ func main() {
 	}
 }
 
-// runSession handles exactly one TCP connection to the stub: one
-// handshake (hello, then launch) followed by relaying until either side
-// disconnects or real mpv exits. It never returns an error - by design,
-// every failure here just means "go back to redialing", which main's
-// loop already does.
-//
-// The handshake reads carry a bounded deadline. A plain TCP connect can
-// succeed (and this agent will log "connected") even when the connection
-// never actually delivers data afterward - a stale Docker port-forward
-// left over from a container restart, a NAT/firewall that lets the SYN
-// through but blackholes the rest, or a stub that never gets around to
-// writing anything. Without a deadline here, a hung connection wedges
-// this agent forever: it sits inside this one runSession call with
-// nothing left to log and never returns to main's retry loop, so every
-// later Seanime playback attempt spins up a fresh stub that waits for an
-// agent that, from the outside, looks alive but is actually stuck talking
-// to a session that already died. The deadline is cleared before the
-// relay loop below, which must tolerate arbitrarily long silence (e.g. a
-// paused video).
+// runSession handles one TCP connection to the stub: handshake, then
+// relaying until either side disconnects or mpv exits. It never returns
+// an error - any failure just means "go back to redialing" in main.
 func runSession(conn net.Conn, mpvPath string) {
 	defer conn.Close()
 
-	// One Reader/Writer pair for this conn's entire life - reused across
-	// the handshake and the relay loop that follows. See internal/proto's
-	// package doc: a second reader on the same conn would silently drop
-	// whatever the first had already buffered.
+	// One Reader/Writer pair for this conn's entire life - see internal/proto.
 	r := proto.NewReader(conn)
 	w := proto.NewWriter(conn)
 
@@ -101,6 +68,10 @@ func runSession(conn net.Conn, mpvPath string) {
 		return
 	}
 
+	// Bounded deadline for the handshake: a plain TCP connect can succeed
+	// even when the connection never delivers data (stale port-forward,
+	// a NAT that blackholes the rest), which would otherwise wedge this
+	// agent forever instead of returning to the retry loop.
 	_ = conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
 
 	hello, err := r.ReadControl()
@@ -118,7 +89,7 @@ func runSession(conn net.Conn, mpvPath string) {
 		rlog.Printf("agent: expected launch, got kind=%q", launch.Kind)
 		return
 	}
-	rlog.Printf("agent: received launch (hasURL=%v, args=%v)", launch.URL != "", launch.Args)
+	rlog.Printf("agent: received launch (url=%s, args=%v)", launch.URL, launch.Args)
 
 	_ = conn.SetReadDeadline(time.Time{})
 
@@ -167,18 +138,10 @@ func runSession(conn net.Conn, mpvPath string) {
 
 func startMpv(mpvPath, pipeName string, launch proto.Control) (*exec.Cmd, error) {
 	args := append([]string{}, launch.Args...)
-	args = append(args, "--input-ipc-server="+pipeName)
-	if launch.URL != "" {
-		args = append(args, launch.URL)
-	} else {
-		args = append(args, "--idle")
-	}
+	args = append(args, "--input-ipc-server="+pipeName, launch.URL)
 
 	cmd := exec.Command(mpvPath, args...)
-	// mpv's own stdout/stderr chatter isn't needed by anything here, but
-	// draining it (instead of leaving it connected to nothing/inherited)
-	// avoids mpv ever blocking on a full pipe buffer.
-	cmd.Stdout = nil
+	cmd.Stdout = nil // drain instead of inheriting, so mpv never blocks on a full pipe buffer
 	cmd.Stderr = nil
 	if err := cmd.Start(); err != nil {
 		return nil, err
@@ -186,10 +149,9 @@ func startMpv(mpvPath, pipeName string, launch proto.Control) (*exec.Cmd, error)
 	return cmd, nil
 }
 
-// freshPipeName returns a path for a new, unique local IPC endpoint for
-// mpv's --input-ipc-server: a named pipe on Windows, a Unix domain socket
-// path everywhere else - whichever kind of endpoint the real mpv on this
-// machine will actually create.
+// freshPipeName returns a unique local IPC endpoint path for
+// --input-ipc-server: a named pipe on Windows, a Unix domain socket
+// elsewhere.
 func freshPipeName() string {
 	id := fmt.Sprintf("mpvrelay_%d_%d", os.Getpid(), time.Now().UnixNano())
 	if runtime.GOOS == "windows" {
@@ -198,11 +160,9 @@ func freshPipeName() string {
 	return filepath.Join(os.TempDir(), id+".sock")
 }
 
-// dialPipeWithRetry mirrors the retry shape of
-// internal/mediaplayers/mpv/mpv.go's establishConnection: mpv.exe needs
-// a brief moment after Start() returns before its named pipe server is
-// actually listening. It also gives up early if mpv.exe has already
-// exited, rather than waiting out the full timeout.
+// dialPipeWithRetry retries because mpv needs a moment after Start()
+// before its IPC pipe is listening; it gives up early if mpv already
+// exited instead of waiting out the full timeout.
 func dialPipeWithRetry(pipeName string, timeout time.Duration, mpvExited <-chan error) (net.Conn, error) {
 	deadline := time.Now().Add(timeout)
 	for {
@@ -249,33 +209,28 @@ func relayTCPToPipe(r *proto.Reader, pipeConn net.Conn, errCh chan<- error) {
 }
 
 func relayPipeToTCP(pipeConn net.Conn, w *proto.Writer, errCh chan<- error) {
-	lines := ipcline.NewReader(pipeConn)
-	for {
-		line, err := lines.ReadLine()
-		if err != nil {
-			errCh <- fmt.Errorf("mpv->stub: reading from mpv pipe: %w", err)
-			return
-		}
-		if err := w.WriteIPCLine(line); err != nil {
+	scanner := bufio.NewScanner(pipeConn)
+	for scanner.Scan() {
+		if err := w.WriteIPCLine(scanner.Bytes()); err != nil {
 			errCh <- fmt.Errorf("mpv->stub: writing to stub: %w", err)
 			return
 		}
 	}
+	err := scanner.Err()
+	if err == nil {
+		err = io.EOF
+	}
+	errCh <- fmt.Errorf("mpv->stub: reading from mpv pipe: %w", err)
 }
 
-// killMpv makes sure mpv.exe is gone before this session's cleanup
-// finishes, so the next session on this agent is guaranteed a clean
-// start (see README - deliberately not attempting to keep a warm
-// instance around across sessions yet).
+// killMpv ensures mpv is gone before session cleanup finishes, so the
+// next session gets a clean start.
 func killMpv(cmd *exec.Cmd, mpvExited <-chan error) {
 	select {
 	case <-mpvExited:
 		return // already exited on its own
 	default:
 	}
-	// Ask mpv to quit itself first would require sending an IPC "quit"
-	// command down a pipe that may already be gone; a direct kill is
-	// simpler and this tool doesn't need mpv to save any state on exit.
 	_ = cmd.Process.Kill()
 	select {
 	case <-mpvExited:
