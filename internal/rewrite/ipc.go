@@ -18,8 +18,7 @@ type propertyEvent struct {
 	Data  json.RawMessage `json:"data"`
 }
 
-// IPCRewriter is only used stub-side (cmd/mpv), the side that knows the
-// server's base URL and password.
+// IPCRewriter is only used stub-side (cmd/mpv).
 type IPCRewriter struct {
 	serverBaseURL  string
 	serverPassword string

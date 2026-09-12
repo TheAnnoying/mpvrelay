@@ -12,13 +12,10 @@ import (
 	"time"
 )
 
-// Dial connects to a local Unix domain socket, e.g. the one real mpv
-// creates for --input-ipc-server.
 func Dial(path string, timeout time.Duration) (net.Conn, error) {
 	return net.DialTimeout("unix", path, timeout)
 }
 
-// Listen creates the listener Seanime will dial as the mpv IPC socket.
 func Listen(path string) (net.Listener, error) {
 	// A stale socket path is a leftover from an unclean exit, not a live
 	// listener (a live one fails the bind below with EADDRINUSE).

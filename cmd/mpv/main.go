@@ -82,8 +82,7 @@ func run() error {
 	defer seanimeConn.Close()
 	defer agentConn.Close()
 
-	// One scanner for agentConn's whole life - see internal/proto's doc.
-	agentScanner := bufio.NewScanner(agentConn)
+	agentScanner := bufio.NewScanner(agentConn) // reused for the conn's whole life, see internal/proto
 
 	streamURL, err := rewrite.BuildStreamURL(serverBaseURL, serverPassword, mediaPath)
 	if err != nil {
@@ -115,7 +114,6 @@ func run() error {
 	return nil
 }
 
-// writeJSONLine writes v as one line of JSON, newline-terminated.
 func writeJSONLine(w io.Writer, v any) error {
 	data, err := json.Marshal(v)
 	if err != nil {
@@ -125,8 +123,7 @@ func writeJSONLine(w io.Writer, v any) error {
 	return err
 }
 
-// parseArgv splits Seanime's argv: the file path is always the last
-// argument that isn't itself a flag.
+// Seanime always appends the file path last, after every flag.
 func parseArgv(args []string) (ipcSocketPath, mediaPath string, passthrough []string) {
 	n := len(args)
 	lastIsPath := n > 0 && !strings.HasPrefix(args[n-1], "-")
@@ -171,8 +168,6 @@ type acceptResult struct {
 	err  error
 }
 
-// acceptBoth waits for Seanime (IPC socket) and the agent (TCP) to both
-// connect, in whichever order they arrive in.
 func acceptBoth(ipcListener, tcpListener net.Listener, timeout time.Duration) (seanimeConn, agentConn net.Conn, err error) {
 	ipcCh := make(chan acceptResult, 1)
 	agentCh := make(chan acceptResult, 1)
@@ -209,9 +204,10 @@ func acceptBoth(ipcListener, tcpListener net.Listener, timeout time.Duration) (s
 	return seanimeConn, agentConn, nil
 }
 
-// waitForReady blocks briefly for the agent's one-line ack, mainly so an
-// early agent-side error surfaces immediately instead of as a later
-// timeout on Seanime's side.
+// Not required for correctness (IPC lines sent before this returns are
+// just relayed once the agent connects) - lets an agent-side startup
+// error surface immediately instead of as a later timeout on Seanime's
+// side.
 func waitForReady(agentConn net.Conn, agentScanner *bufio.Scanner, timeout time.Duration) {
 	_ = agentConn.SetReadDeadline(time.Now().Add(timeout))
 	defer func() { _ = agentConn.SetReadDeadline(time.Time{}) }()

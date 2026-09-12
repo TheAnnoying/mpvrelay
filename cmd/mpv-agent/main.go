@@ -56,14 +56,12 @@ func main() {
 	}
 }
 
-// runSession handles one TCP connection to the stub: handshake, then
-// relaying until either side disconnects or mpv exits. It never returns
-// an error - any failure just means "go back to redialing" in main.
+// runSession never returns an error - any failure just means "go back
+// to redialing" in main.
 func runSession(conn net.Conn, mpvPath string) {
 	defer conn.Close()
 
-	// One scanner for this conn's entire life - see internal/proto's doc.
-	scanner := bufio.NewScanner(conn)
+	scanner := bufio.NewScanner(conn) // reused for the conn's whole life, see internal/proto
 
 	// Bounded deadline for the handshake: a plain TCP connect can succeed
 	// even when the connection never delivers data (stale port-forward,
@@ -126,8 +124,7 @@ func runSession(conn net.Conn, mpvPath string) {
 	killMpv(cmd, mpvExited)
 }
 
-// writeAck sends the one-line ack the stub waits for: empty errMsg means
-// mpv is up and relaying is starting; non-empty means startup failed.
+// writeAck: empty errMsg means mpv is up and relaying is starting.
 func writeAck(conn net.Conn, errMsg string) error {
 	data, err := json.Marshal(proto.Ack{Error: errMsg})
 	if err != nil {
@@ -150,9 +147,6 @@ func startMpv(mpvPath, pipeName string, launch proto.Launch) (*exec.Cmd, error) 
 	return cmd, nil
 }
 
-// freshPipeName returns a unique local IPC endpoint path for
-// --input-ipc-server: a named pipe on Windows, a Unix domain socket
-// elsewhere.
 func freshPipeName() string {
 	id := fmt.Sprintf("mpvrelay_%d_%d", os.Getpid(), time.Now().UnixNano())
 	if runtime.GOOS == "windows" {
@@ -212,8 +206,7 @@ func relayPipeToTCP(pipeConn, stubConn net.Conn, errCh chan<- error) {
 	errCh <- fmt.Errorf("mpv->stub: reading from mpv pipe: %w", err)
 }
 
-// killMpv ensures mpv is gone before session cleanup finishes, so the
-// next session gets a clean start.
+// killMpv makes sure the next session starts against a clean mpv, not one still winding down.
 func killMpv(cmd *exec.Cmd, mpvExited <-chan error) {
 	select {
 	case <-mpvExited:
