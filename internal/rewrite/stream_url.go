@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"path"
 	"strings"
 	"time"
 )
@@ -99,6 +100,40 @@ func BuildStreamURL(serverBaseURL, serverPassword, realAbsPath string) (string, 
 	u.RawQuery = q.Encode()
 
 	return u.String(), nil
+}
+
+// IsMediaURL reports whether mediaPath is already a URL Seanime wants
+// mpv to open directly - torrent streaming, which points at Seanime's
+// own embedded torrent-stream server - rather than a real absolute
+// filesystem path that needs BuildStreamURL.
+func IsMediaURL(mediaPath string) bool {
+	u, err := url.Parse(mediaPath)
+	return err == nil && u.Scheme != "" && u.Host != ""
+}
+
+// RewriteTorrentStreamURL rewrites a Seanime torrent-stream URL's host.
+// Seanime binds that embedded server to a loopback address, meaningful
+// only on the server's own machine, so this swaps in the server's LAN
+// hostname (from serverBaseURL) while keeping the original port, path
+// and query - including Seanime's own already-valid token - untouched.
+// title is a display name for mpv's window, derived from the URL path.
+func RewriteTorrentStreamURL(serverBaseURL, mediaURL string) (rewrittenURL, title string, err error) {
+	u, err := url.Parse(mediaURL)
+	if err != nil {
+		return "", "", fmt.Errorf("rewrite: invalid torrent-stream URL %q: %w", mediaURL, err)
+	}
+	base, err := url.Parse(serverBaseURL)
+	if err != nil {
+		return "", "", fmt.Errorf("rewrite: invalid server base URL %q: %w", serverBaseURL, err)
+	}
+
+	host := base.Hostname()
+	if port := u.Port(); port != "" {
+		host += ":" + port
+	}
+	u.Host = host
+
+	return u.String(), path.Base(u.Path), nil
 }
 
 // ExtractPathFromStreamURL is BuildStreamURL's inverse. ok is false for

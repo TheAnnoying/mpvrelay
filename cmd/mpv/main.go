@@ -84,16 +84,29 @@ func run() error {
 
 	agentScanner := bufio.NewScanner(agentConn) // reused for the conn's whole life, see internal/proto
 
-	streamURL, err := rewrite.BuildStreamURL(serverBaseURL, serverPassword, mediaPath)
-	if err != nil {
-		return fmt.Errorf("building stream URL for %q: %w", mediaPath, err)
+	var streamURL, title string
+	if rewrite.IsMediaURL(mediaPath) {
+		// Torrent streaming: Seanime already gives us a URL, to its own
+		// embedded torrent-stream server - bound to a loopback address
+		// that only means anything on the server's own machine.
+		streamURL, title, err = rewrite.RewriteTorrentStreamURL(serverBaseURL, mediaPath)
+		if err != nil {
+			return fmt.Errorf("rewriting torrent-stream URL %q: %w", mediaPath, err)
+		}
+		rlog.Printf("stub: rewrote torrent-stream URL for the client")
+	} else {
+		streamURL, err = rewrite.BuildStreamURL(serverBaseURL, serverPassword, mediaPath)
+		if err != nil {
+			return fmt.Errorf("building stream URL for %q: %w", mediaPath, err)
+		}
+		title = filepath.Base(mediaPath)
+		rlog.Printf("stub: built stream URL for real mpv to open")
 	}
-	rlog.Printf("stub: built stream URL for real mpv to open")
 
-	// mpv would otherwise title its window after the stream URL's own
-	// query string (the base64 path + HMAC token), since it has no real
+	// mpv would otherwise title its window after the URL's own query
+	// string (the base64 path + HMAC token), since it has no real
 	// filesystem path to derive a title from.
-	titleArg := "--force-media-title=" + filepath.Base(mediaPath)
+	titleArg := "--force-media-title=" + title
 	launch := proto.Launch{URL: streamURL, Args: append([]string{titleArg}, passthroughArgs...)}
 	rlog.Printf("stub: sending launch to agent (%d passthrough args)", len(launch.Args))
 	if err := writeJSONLine(agentConn, launch); err != nil {
