@@ -143,24 +143,24 @@ server's own host.
 Run the agent persistently on the machine with the real screen and real
 mpv (a scheduled task at logon on Windows, a systemd user service on
 Linux, or any equivalent of "start this in the background and keep it
-running" works). It needs:
+running" works). It takes command-line flags:
 
-| Variable | Meaning | Default |
+| Flag | Meaning | Default |
 |---|---|---|
-| `SEANIME_MPV_RELAY_SERVER` | `host:port` of the server's relay port, e.g. `myserver.local:43219` | *(required)* |
-| `SEANIME_MPV_RELAY_MPV_PATH` | Path to the real `mpv`/`mpv.exe` | `mpv` (via `PATH`) |
+| `-server` | `host:port` of the server's relay port, e.g. `myserver.local:43219` | *(required)* |
+| `-mpv` | Path to the real `mpv`/`mpv.exe` | `mpv` (via `PATH`) |
+
+```sh
+mpv-agent -server myserver.local:43219
+mpv-agent -server myserver.local:43219 -mpv "C:\Program Files\mpv\mpv.exe"
+```
 
 Everything else (retry interval, dial/handshake/pipe timeouts) is a fixed
 constant in the code, not something a deployment should need to tune.
 
-**cmd.exe quoting pitfall:** `set VAR="value"` does not strip the quotes
-the way a POSIX shell would — `os.Getenv` would see the literal
-characters `"value"`, quotes included, if this weren't handled. Every
-value read from the environment on both sides goes through
-`internal/envcfg.Clean`, which trims whitespace and a matching pair of
-leading/trailing quote characters, so configuring things this way (or via
-a GUI that does the same thing) doesn't silently break in a confusing
-way.
+The server-side stub (`cmd/mpv`) still takes its configuration from
+environment variables — see "Deploying the server-side stub" above,
+including the cmd.exe quoting pitfall that applies there.
 
 ## Diagnosing startup timing
 

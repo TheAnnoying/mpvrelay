@@ -3,12 +3,13 @@
 // TCP, and on each session launches real mpv locally and tunnels its
 // IPC socket/pipe back over that connection - byte for byte, with zero
 // interpretation of the traffic (see internal/rewrite for why that lives
-// only on the server side). See ../../README.md for env vars.
+// only on the server side). See ../../README.md for flags.
 package main
 
 import (
 	"bufio"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -18,7 +19,6 @@ import (
 	"runtime"
 	"time"
 
-	"mpvrelay/internal/envcfg"
 	"mpvrelay/internal/proto"
 	"mpvrelay/internal/rlog"
 	"mpvrelay/internal/sockets"
@@ -32,23 +32,26 @@ const (
 )
 
 func main() {
-	serverAddr := envcfg.Get("SEANIME_MPV_RELAY_SERVER", "")
-	if serverAddr == "" {
-		rlog.Printf("agent: fatal: SEANIME_MPV_RELAY_SERVER is not set (expected host:port, e.g. myserver.local:43219)")
+	server := flag.String("server", "", "host:port of the mpv stub's relay port, e.g. myserver.local:43219 (required)")
+	mpvPath := flag.String("mpv", "mpv", "path to the real mpv/mpv.exe binary")
+	flag.Parse()
+
+	if *server == "" {
+		fmt.Fprintln(os.Stderr, "agent: fatal: -server is required (expected host:port, e.g. myserver.local:43219)")
+		flag.Usage()
 		os.Exit(1)
 	}
-	mpvPath := envcfg.Get("SEANIME_MPV_RELAY_MPV_PATH", "mpv")
 
-	rlog.Printf("agent: starting; server=%s mpv=%s", serverAddr, mpvPath)
+	rlog.Printf("agent: starting; server=%s mpv=%s", *server, *mpvPath)
 
 	for {
-		conn, err := net.DialTimeout("tcp", serverAddr, dialTimeout)
+		conn, err := net.DialTimeout("tcp", *server, dialTimeout)
 		if err != nil {
 			time.Sleep(retryInterval)
 			continue
 		}
-		rlog.Printf("agent: connected to stub at %s", serverAddr)
-		runSession(conn, mpvPath)
+		rlog.Printf("agent: connected to stub at %s", *server)
+		runSession(conn, *mpvPath)
 		rlog.Printf("agent: session ended, resuming retry loop")
 	}
 }
@@ -59,14 +62,8 @@ func main() {
 func runSession(conn net.Conn, mpvPath string) {
 	defer conn.Close()
 
-	// One Reader/Writer pair for this conn's entire life - see internal/proto.
-	r := proto.NewReader(conn)
-	w := proto.NewWriter(conn)
-
-	if err := w.WriteControl(proto.Control{Kind: proto.KindHello}); err != nil {
-		rlog.Printf("agent: failed to send hello: %v", err)
-		return
-	}
+	// One scanner for this conn's entire life - see internal/proto's doc.
+	scanner := bufio.NewScanner(conn)
 
 	// Bounded deadline for the handshake: a plain TCP connect can succeed
 	// even when the connection never delivers data (stale port-forward,
@@ -74,19 +71,13 @@ func runSession(conn net.Conn, mpvPath string) {
 	// agent forever instead of returning to the retry loop.
 	_ = conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
 
-	hello, err := r.ReadControl()
-	if err != nil || hello.Kind != proto.KindHello {
-		rlog.Printf("agent: did not receive hello from stub within %s (got %+v, err=%v)", handshakeTimeout, hello, err)
+	if !scanner.Scan() {
+		rlog.Printf("agent: did not receive launch from stub within %s: %v", handshakeTimeout, scanner.Err())
 		return
 	}
-
-	launch, err := r.ReadControl()
-	if err != nil {
-		rlog.Printf("agent: failed to read launch message within %s: %v", handshakeTimeout, err)
-		return
-	}
-	if launch.Kind != proto.KindLaunch {
-		rlog.Printf("agent: expected launch, got kind=%q", launch.Kind)
+	var launch proto.Launch
+	if err := json.Unmarshal(scanner.Bytes(), &launch); err != nil {
+		rlog.Printf("agent: malformed launch message from stub: %v", err)
 		return
 	}
 	rlog.Printf("agent: received launch (url=%s, args=%v)", launch.URL, launch.Args)
@@ -96,8 +87,8 @@ func runSession(conn net.Conn, mpvPath string) {
 	pipeName := freshPipeName()
 	cmd, err := startMpv(mpvPath, pipeName, launch)
 	if err != nil {
-		rlog.Printf("agent: failed to start mpv: %v", err)
-		_ = w.WriteControl(proto.Control{Kind: proto.KindError, Message: fmt.Sprintf("starting mpv: %v", err)})
+		rlog.Printf("agent: ERROR: mpv could not be started (is -mpv=%q correct?): %v", mpvPath, err)
+		_ = writeAck(conn, fmt.Sprintf("starting mpv: %v", err))
 		return
 	}
 	rlog.Printf("agent: started mpv.exe (pid=%d), waiting for its IPC pipe", cmd.Process.Pid)
@@ -107,23 +98,23 @@ func runSession(conn net.Conn, mpvPath string) {
 
 	pipeConn, err := dialPipeWithRetry(pipeName, pipeReadyTimeout, mpvExited)
 	if err != nil {
-		rlog.Printf("agent: failed to connect to mpv's IPC pipe: %v", err)
-		_ = w.WriteControl(proto.Control{Kind: proto.KindError, Message: fmt.Sprintf("connecting to mpv IPC pipe: %v", err)})
+		rlog.Printf("agent: ERROR: mpv started but never opened its IPC pipe: %v", err)
+		_ = writeAck(conn, fmt.Sprintf("connecting to mpv IPC pipe: %v", err))
 		killMpv(cmd, mpvExited)
 		return
 	}
 	defer pipeConn.Close()
 	rlog.Printf("agent: connected to mpv's IPC pipe, relaying")
 
-	if err := w.WriteControl(proto.Control{Kind: proto.KindReady}); err != nil {
+	if err := writeAck(conn, ""); err != nil {
 		rlog.Printf("agent: failed to send ready: %v", err)
 		killMpv(cmd, mpvExited)
 		return
 	}
 
 	errCh := make(chan error, 3)
-	go relayTCPToPipe(r, pipeConn, errCh)
-	go relayPipeToTCP(pipeConn, w, errCh)
+	go relayTCPToPipe(scanner, pipeConn, errCh)
+	go relayPipeToTCP(pipeConn, conn, errCh)
 	go func() {
 		err := <-mpvExited
 		errCh <- fmt.Errorf("mpv.exe exited: %v", err)
@@ -131,12 +122,22 @@ func runSession(conn net.Conn, mpvPath string) {
 
 	sessionErr := <-errCh
 	rlog.Printf("agent: relay ended: %v", sessionErr)
-	_ = w.WriteControl(proto.Control{Kind: proto.KindBye, Message: sessionErr.Error()})
 
 	killMpv(cmd, mpvExited)
 }
 
-func startMpv(mpvPath, pipeName string, launch proto.Control) (*exec.Cmd, error) {
+// writeAck sends the one-line ack the stub waits for: empty errMsg means
+// mpv is up and relaying is starting; non-empty means startup failed.
+func writeAck(conn net.Conn, errMsg string) error {
+	data, err := json.Marshal(proto.Ack{Error: errMsg})
+	if err != nil {
+		return err
+	}
+	_, err = conn.Write(append(data, '\n'))
+	return err
+}
+
+func startMpv(mpvPath, pipeName string, launch proto.Launch) (*exec.Cmd, error) {
 	args := append([]string{}, launch.Args...)
 	args = append(args, "--input-ipc-server="+pipeName, launch.URL)
 
@@ -182,36 +183,24 @@ func dialPipeWithRetry(pipeName string, timeout time.Duration, mpvExited <-chan 
 	}
 }
 
-func relayTCPToPipe(r *proto.Reader, pipeConn net.Conn, errCh chan<- error) {
-	for {
-		f, err := r.ReadFrame()
-		if err != nil {
-			errCh <- fmt.Errorf("stub->mpv: reading from stub: %w", err)
+func relayTCPToPipe(scanner *bufio.Scanner, pipeConn net.Conn, errCh chan<- error) {
+	for scanner.Scan() {
+		if _, err := pipeConn.Write(append(scanner.Bytes(), '\n')); err != nil {
+			errCh <- fmt.Errorf("stub->mpv: writing to mpv pipe: %w", err)
 			return
 		}
-		switch f.Type {
-		case proto.TypeIPCLine:
-			if _, err := pipeConn.Write(append(f.Payload, '\n')); err != nil {
-				errCh <- fmt.Errorf("stub->mpv: writing to mpv pipe: %w", err)
-				return
-			}
-		case proto.TypeControl:
-			var c proto.Control
-			if json.Unmarshal(f.Payload, &c) == nil {
-				rlog.Printf("agent: control from stub mid-session: kind=%s message=%q", c.Kind, c.Message)
-				if c.Kind == proto.KindBye || c.Kind == proto.KindError {
-					errCh <- fmt.Errorf("stub ended the session: %s", c.Message)
-					return
-				}
-			}
-		}
 	}
+	err := scanner.Err()
+	if err == nil {
+		err = io.EOF
+	}
+	errCh <- fmt.Errorf("stub->mpv: reading from stub: %w", err)
 }
 
-func relayPipeToTCP(pipeConn net.Conn, w *proto.Writer, errCh chan<- error) {
+func relayPipeToTCP(pipeConn, stubConn net.Conn, errCh chan<- error) {
 	scanner := bufio.NewScanner(pipeConn)
 	for scanner.Scan() {
-		if err := w.WriteIPCLine(scanner.Bytes()); err != nil {
+		if _, err := stubConn.Write(append(scanner.Bytes(), '\n')); err != nil {
 			errCh <- fmt.Errorf("mpv->stub: writing to stub: %w", err)
 			return
 		}

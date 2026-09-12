@@ -13,10 +13,10 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
-	"mpvrelay/internal/envcfg"
 	"mpvrelay/internal/proto"
 	"mpvrelay/internal/rewrite"
 	"mpvrelay/internal/rlog"
@@ -53,9 +53,9 @@ func run() error {
 			"this binary is only meant to be launched by Seanime, not run by hand")
 	}
 
-	relayPort := envcfg.Get("SEANIME_MPV_RELAY_PORT", "43219")
-	serverBaseURL := envcfg.Get("SEANIME_MPV_RELAY_SEANIME_URL", "")
-	serverPassword := envcfg.Get("SEANIME_MPV_RELAY_PASSWORD", "")
+	relayPort := getenv("SEANIME_MPV_RELAY_PORT", "43219")
+	serverBaseURL := getenv("SEANIME_MPV_RELAY_SEANIME_URL", "")
+	serverPassword := getenv("SEANIME_MPV_RELAY_PASSWORD", "")
 
 	if serverBaseURL == "" {
 		return fmt.Errorf("SEANIME_MPV_RELAY_SEANIME_URL is not set; cannot build a stream URL for %q", mediaPath)
@@ -82,13 +82,8 @@ func run() error {
 	defer seanimeConn.Close()
 	defer agentConn.Close()
 
-	// One Reader/Writer pair for agentConn's whole life - see internal/proto.
-	agentR := proto.NewReader(agentConn)
-	agentW := proto.NewWriter(agentConn)
-
-	if err := agentW.WriteControl(proto.Control{Kind: proto.KindHello}); err != nil {
-		return fmt.Errorf("sending hello to agent: %w", err)
-	}
+	// One scanner for agentConn's whole life - see internal/proto's doc.
+	agentScanner := bufio.NewScanner(agentConn)
 
 	streamURL, err := rewrite.BuildStreamURL(serverBaseURL, serverPassword, mediaPath)
 	if err != nil {
@@ -96,26 +91,38 @@ func run() error {
 	}
 	rlog.Printf("stub: built stream URL for real mpv to open")
 
-	launch := proto.Control{Kind: proto.KindLaunch, Args: passthroughArgs, URL: streamURL}
+	// mpv would otherwise title its window after the stream URL's own
+	// query string (the base64 path + HMAC token), since it has no real
+	// filesystem path to derive a title from.
+	titleArg := "--force-media-title=" + filepath.Base(mediaPath)
+	launch := proto.Launch{URL: streamURL, Args: append([]string{titleArg}, passthroughArgs...)}
 	rlog.Printf("stub: sending launch to agent (%d passthrough args)", len(launch.Args))
-	if err := agentW.WriteControl(launch); err != nil {
+	if err := writeJSONLine(agentConn, launch); err != nil {
 		return fmt.Errorf("sending launch to agent: %w", err)
 	}
 
-	waitForReady(agentConn, agentR, readyTimeout)
+	waitForReady(agentConn, agentScanner, readyTimeout)
 
 	rewriter := rewrite.NewIPCRewriter(serverBaseURL, serverPassword)
 
 	errCh := make(chan error, 2)
-	go relaySeanimeToAgent(seanimeConn, agentW, rewriter, errCh)
-	go relayAgentToSeanime(agentR, seanimeConn, rewriter, errCh)
+	go relaySeanimeToAgent(seanimeConn, agentConn, rewriter, errCh)
+	go relayAgentToSeanime(agentScanner, seanimeConn, rewriter, errCh)
 
 	sessionErr := <-errCh
 	rlog.Printf("stub: session ended: %v", sessionErr)
 
-	_ = agentW.WriteControl(proto.Control{Kind: proto.KindBye, Message: sessionErr.Error()})
-
 	return nil
+}
+
+// writeJSONLine writes v as one line of JSON, newline-terminated.
+func writeJSONLine(w io.Writer, v any) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(append(data, '\n'))
+	return err
 }
 
 // parseArgv splits Seanime's argv: the file path is always the last
@@ -138,6 +145,25 @@ func parseArgv(args []string) (ipcSocketPath, mediaPath string, passthrough []st
 		passthrough = append(passthrough, a)
 	}
 	return ipcSocketPath, mediaPath, passthrough
+}
+
+// getenv returns the env var's value, or def if unset/empty, after
+// stripping a stray cmd.exe quote pair: `set VAR="value"` leaves the
+// quotes in os.Getenv, unlike a POSIX shell.
+func getenv(key, def string) string {
+	v := strings.TrimSpace(os.Getenv(key))
+	for len(v) >= 2 {
+		first, last := v[0], v[len(v)-1]
+		if (first == '"' || first == '\'') && first == last {
+			v = strings.TrimSpace(v[1 : len(v)-1])
+			continue
+		}
+		break
+	}
+	if v == "" {
+		return def
+	}
+	return v
 }
 
 type acceptResult struct {
@@ -183,36 +209,34 @@ func acceptBoth(ipcListener, tcpListener net.Listener, timeout time.Duration) (s
 	return seanimeConn, agentConn, nil
 }
 
-// waitForReady blocks briefly for the agent to confirm its mpv is ready,
-// mainly so an early agent-side error surfaces immediately instead of as
-// a later timeout on Seanime's side.
-func waitForReady(agentConn net.Conn, agentR *proto.Reader, timeout time.Duration) {
-	deadline := time.Now().Add(timeout)
-	_ = agentConn.SetReadDeadline(deadline)
+// waitForReady blocks briefly for the agent's one-line ack, mainly so an
+// early agent-side error surfaces immediately instead of as a later
+// timeout on Seanime's side.
+func waitForReady(agentConn net.Conn, agentScanner *bufio.Scanner, timeout time.Duration) {
+	_ = agentConn.SetReadDeadline(time.Now().Add(timeout))
 	defer func() { _ = agentConn.SetReadDeadline(time.Time{}) }()
 
-	for {
-		c, err := agentR.ReadControl()
-		if err != nil {
-			rlog.Printf("stub: no ready confirmation from agent within %s (%v); relaying anyway", timeout, err)
-			return
-		}
-		switch c.Kind {
-		case proto.KindReady:
-			rlog.Printf("stub: agent confirmed its real mpv is ready")
-			return
-		case proto.KindError:
-			rlog.Printf("stub: agent reported an error while starting up: %s", c.Message)
-			return
-		}
+	if !agentScanner.Scan() {
+		rlog.Printf("stub: no ready confirmation from agent within %s (%v); relaying anyway", timeout, agentScanner.Err())
+		return
 	}
+	var ack proto.Ack
+	if err := json.Unmarshal(agentScanner.Bytes(), &ack); err != nil {
+		rlog.Printf("stub: malformed ready confirmation from agent: %v", err)
+		return
+	}
+	if ack.Error != "" {
+		rlog.Printf("stub: agent reported an error while starting up: %s", ack.Error)
+		return
+	}
+	rlog.Printf("stub: agent confirmed its real mpv is ready")
 }
 
-func relaySeanimeToAgent(seanimeConn net.Conn, agentW *proto.Writer, rewriter *rewrite.IPCRewriter, errCh chan<- error) {
+func relaySeanimeToAgent(seanimeConn, agentConn net.Conn, rewriter *rewrite.IPCRewriter, errCh chan<- error) {
 	scanner := bufio.NewScanner(seanimeConn)
 	for scanner.Scan() {
 		rewritten := rewriter.RewriteOutgoing(scanner.Bytes())
-		if err := agentW.WriteIPCLine(rewritten); err != nil {
+		if _, err := agentConn.Write(append(rewritten, '\n')); err != nil {
 			errCh <- fmt.Errorf("Seanime->agent: writing to agent: %w", err)
 			return
 		}
@@ -224,29 +248,17 @@ func relaySeanimeToAgent(seanimeConn net.Conn, agentW *proto.Writer, rewriter *r
 	errCh <- fmt.Errorf("Seanime->agent: reading from Seanime: %w", err)
 }
 
-func relayAgentToSeanime(agentR *proto.Reader, seanimeConn net.Conn, rewriter *rewrite.IPCRewriter, errCh chan<- error) {
-	for {
-		f, err := agentR.ReadFrame()
-		if err != nil {
-			errCh <- fmt.Errorf("agent->Seanime: reading from agent: %w", err)
+func relayAgentToSeanime(agentScanner *bufio.Scanner, seanimeConn net.Conn, rewriter *rewrite.IPCRewriter, errCh chan<- error) {
+	for agentScanner.Scan() {
+		rewritten := rewriter.RewriteIncoming(agentScanner.Bytes())
+		if _, err := seanimeConn.Write(append(rewritten, '\n')); err != nil {
+			errCh <- fmt.Errorf("agent->Seanime: writing to Seanime: %w", err)
 			return
 		}
-		switch f.Type {
-		case proto.TypeIPCLine:
-			rewritten := rewriter.RewriteIncoming(f.Payload)
-			if _, err := seanimeConn.Write(append(rewritten, '\n')); err != nil {
-				errCh <- fmt.Errorf("agent->Seanime: writing to Seanime: %w", err)
-				return
-			}
-		case proto.TypeControl:
-			var c proto.Control
-			if json.Unmarshal(f.Payload, &c) == nil {
-				rlog.Printf("stub: control from agent mid-session: kind=%s message=%q", c.Kind, c.Message)
-				if c.Kind == proto.KindBye || c.Kind == proto.KindError {
-					errCh <- fmt.Errorf("agent ended the session: %s", c.Message)
-					return
-				}
-			}
-		}
 	}
+	err := agentScanner.Err()
+	if err == nil {
+		err = io.EOF
+	}
+	errCh <- fmt.Errorf("agent->Seanime: reading from agent: %w", err)
 }

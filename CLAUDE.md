@@ -44,13 +44,19 @@ Seanime (server) --socket/pipe--> [mpv stub] --TCP--> [mpv-agent] --socket/pipe-
                                 HTTP GET /api/v1/mediastream/file (Range) <---------------+
 ```
 
-The two binaries share a single TCP connection framed by `internal/proto`
-(1-byte type + 4-byte big-endian length + payload). Two frame types share
-that connection: a JSON `Control` handshake message (`hello` →
-agent-to-stub, `launch` → stub-to-agent, `ready`/`error`/`bye`) and raw
-`IPCLine` frames carrying exactly one line of mpv's JSON-IPC protocol.
-On the socket/pipe side, IPC lines are unframed newline-delimited JSON,
-read with a `bufio.Scanner` directly in `cmd/mpv`/`cmd/mpv-agent`.
+The two binaries share a single TCP connection with no binary framing at
+all: `internal/proto` defines just two tiny JSON structs, `Launch`
+(stub→agent, sent once right after connecting: the mediastream URL plus
+any extra mpv flags) and `Ack` (agent→stub, sent once: empty `Error`
+means its mpv is up and relaying is starting). Each is exactly one
+newline-terminated JSON line; order alone disambiguates the handshake
+from what follows, since it always happens first. After that one
+exchange, the *same* connection becomes a plain newline-delimited relay
+of raw mpv IPC lines — read with a `bufio.Scanner` directly in
+`cmd/mpv`/`cmd/mpv-agent`, the identical pattern already used on the
+local socket/pipe side. There's no mid-session control channel: a
+session ends when either side closes the connection, and each side logs
+its own reason locally rather than the peer's.
 
 **Byte-for-byte relay is the default; content-aware rewriting is the
 narrow exception.** `internal/rewrite` is the *only* package in the whole
@@ -86,14 +92,19 @@ exits after the session ends rather than accepting a second Seanime
 connection.
 
 **Critical invariant, no longer test-enforced:** exactly one
-`bufio.Reader`-backed reader (`internal/proto.Reader`, or the
-`bufio.Scanner` in `cmd/mpv`/`cmd/mpv-agent`'s IPC-line relay loops) must
-be constructed per connection and reused for that connection's entire
-life. A second reader built on the same `net.Conn` silently drops
-whatever bytes the first had already buffered past its last read — this
-caused real data loss in earlier development and has no regression test
-protecting it anymore, so treat it as a hard rule when touching
-connection-handling code, not just a suggestion.
+`bufio.Scanner` must be constructed per connection and reused for that
+connection's entire life — including across the handshake and the relay
+loop that follows on the same connection (see `cmd/mpv`'s `agentScanner`
+and `cmd/mpv-agent`'s `scanner` in `runSession`, each created once and
+handed into the goroutine that keeps reading). A second reader built on
+the same `net.Conn` silently drops whatever bytes the first had already
+buffered past its last read — this caused real data loss in earlier
+development and has no regression test protecting it anymore, so treat
+it as a hard rule when touching connection-handling code, not just a
+suggestion. The corresponding write side needs no such care and no
+mutex: each connection has exactly one writer at a time by construction
+(the handshake line is written before any relay goroutine starts; after
+that, only one goroutine ever writes to a given connection).
 
 **Platform split**: `internal/sockets` has unix/windows build-tagged
 files (`unix.go`/`windows.go`) — Unix domain socket vs. Windows named
@@ -101,10 +112,13 @@ pipe — behind one shared `Dial`/`Listen` API. Both binaries build for
 either OS; which one runs where depends on the deployment (stub on
 Seanime's host, agent on the real-mpv machine), not on the code.
 
-**Config**: both binaries read config from env vars only (no flags, no
-config file), always through `internal/envcfg.Get`, which strips a
-`cmd.exe`-style stray pair of quotes (`set VAR="value"` leaves the quotes
-in Go's `os.Getenv`) — any new env var should go through this same helper.
+**Config**: the two binaries take configuration differently. `cmd/mpv`
+(the server stub) reads env vars only, through its own private `getenv`
+helper (`cmd/mpv/main.go`), which strips a `cmd.exe`-style stray pair of
+quotes (`set VAR="value"` leaves the quotes in Go's `os.Getenv`) — any
+new server env var should go through this same helper. `cmd/mpv-agent`
+takes command-line flags (`-server`, `-mpv`) via the stdlib `flag`
+package instead, and has no env-var config at all.
 
 **Logging**: `internal/rlog.Printf` writes timestamped lines to stderr
 only (stdout is reserved on the stub side for the startup line Seanime's
