@@ -50,15 +50,20 @@ func main() {
 			time.Sleep(retryInterval)
 			continue
 		}
-		rlog.Printf("agent: connected to stub at %s", *server)
-		runSession(conn, *mpvPath)
-		rlog.Printf("agent: session ended, resuming retry loop")
+		if runSession(conn, *mpvPath) {
+			rlog.Printf("agent: session ended, resuming retry loop")
+		} else {
+			// A port-forward can accept and instantly close while no stub
+			// is running; stay quiet and don't redial in a tight loop.
+			time.Sleep(retryInterval)
+		}
 	}
 }
 
 // runSession never returns an error - any failure just means "go back
-// to redialing" in main.
-func runSession(conn net.Conn, mpvPath string) {
+// to redialing" in main. It reports whether the stub sent a launch, i.e.
+// whether this was a real session rather than an idle connection.
+func runSession(conn net.Conn, mpvPath string) bool {
 	defer conn.Close()
 
 	scanner := bufio.NewScanner(conn) // reused for the conn's whole life, see internal/proto
@@ -70,13 +75,12 @@ func runSession(conn net.Conn, mpvPath string) {
 	_ = conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
 
 	if !scanner.Scan() {
-		rlog.Printf("agent: did not receive launch from stub within %s: %v", handshakeTimeout, scanner.Err())
-		return
+		return false
 	}
 	var launch proto.Launch
 	if err := json.Unmarshal(scanner.Bytes(), &launch); err != nil {
 		rlog.Printf("agent: malformed launch message from stub: %v", err)
-		return
+		return false
 	}
 	rlog.Printf("agent: received launch (url=%s, args=%v)", launch.URL, launch.Args)
 
@@ -87,7 +91,7 @@ func runSession(conn net.Conn, mpvPath string) {
 	if err != nil {
 		rlog.Printf("agent: ERROR: mpv could not be started (is -mpv=%q correct?): %v", mpvPath, err)
 		_ = writeAck(conn, fmt.Sprintf("starting mpv: %v", err))
-		return
+		return true
 	}
 	rlog.Printf("agent: started mpv.exe (pid=%d), waiting for its IPC pipe", cmd.Process.Pid)
 
@@ -99,7 +103,7 @@ func runSession(conn net.Conn, mpvPath string) {
 		rlog.Printf("agent: ERROR: mpv started but never opened its IPC pipe: %v", err)
 		_ = writeAck(conn, fmt.Sprintf("connecting to mpv IPC pipe: %v", err))
 		killMpv(cmd, mpvExited)
-		return
+		return true
 	}
 	defer pipeConn.Close()
 	rlog.Printf("agent: connected to mpv's IPC pipe, relaying")
@@ -107,7 +111,7 @@ func runSession(conn net.Conn, mpvPath string) {
 	if err := writeAck(conn, ""); err != nil {
 		rlog.Printf("agent: failed to send ready: %v", err)
 		killMpv(cmd, mpvExited)
-		return
+		return true
 	}
 
 	errCh := make(chan error, 3)
@@ -122,6 +126,7 @@ func runSession(conn net.Conn, mpvPath string) {
 	rlog.Printf("agent: relay ended: %v", sessionErr)
 
 	killMpv(cmd, mpvExited)
+	return true
 }
 
 // writeAck: empty errMsg means mpv is up and relaying is starting.
