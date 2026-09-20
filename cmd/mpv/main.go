@@ -38,8 +38,6 @@ func main() {
 func run() error {
 	args := os.Args[1:]
 	ipcSocketPath, mediaPath, passthroughArgs := parseArgv(args)
-	rlog.Printf("stub: launched with argv=%q", args)
-	rlog.Printf("stub: ipcSocket=%q mediaPath=%q passthroughArgs=%q", ipcSocketPath, mediaPath, passthroughArgs)
 
 	// Seanime's launcher waits for a line of stdout before proceeding.
 	fmt.Println("mpvrelay-stub: starting")
@@ -66,14 +64,13 @@ func run() error {
 		return fmt.Errorf("listening on IPC socket: %w", err)
 	}
 	defer ipcListener.Close()
-	rlog.Printf("stub: listening for Seanime on IPC socket %s", ipcSocketPath)
 
 	tcpListener, err := net.Listen("tcp", ":"+relayPort)
 	if err != nil {
 		return fmt.Errorf("listening on relay TCP port %s: %w", relayPort, err)
 	}
 	defer tcpListener.Close()
-	rlog.Printf("stub: listening for agent on TCP port %s", relayPort)
+	rlog.Printf("stub: waiting for agent on port %s (streaming from %s)", relayPort, serverBaseURL)
 
 	seanimeConn, agentConn, err := acceptBoth(ipcListener, tcpListener, acceptTimeout)
 	if err != nil {
@@ -93,14 +90,12 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("rewriting torrent-stream URL %q: %w", mediaPath, err)
 		}
-		rlog.Printf("stub: rewrote torrent-stream URL for the client")
 	} else {
 		streamURL, err = rewrite.BuildStreamURL(serverBaseURL, serverPassword, mediaPath)
 		if err != nil {
 			return fmt.Errorf("building stream URL for %q: %w", mediaPath, err)
 		}
 		title = filepath.Base(mediaPath)
-		rlog.Printf("stub: built stream URL for real mpv to open")
 	}
 
 	// mpv would otherwise title its window after the URL's own query
@@ -108,9 +103,7 @@ func run() error {
 	// filesystem path to derive a title from.
 	titleArg := "--force-media-title=" + title
 	launch := proto.Launch{URL: streamURL, Args: append([]string{titleArg}, passthroughArgs...)}
-	rlog.Printf("stub: sending launch to agent (%d passthrough args)", len(launch.Args))
 	if err := writeJSONLine(agentConn, launch); err != nil {
-		return fmt.Errorf("sending launch to agent: %w", err)
 	}
 
 	waitForReady(agentConn, agentScanner, readyTimeout)
