@@ -92,10 +92,10 @@ cd tools/mpvrelay
 
 # server-side stub — build for whatever Seanime's own host runs on
 CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -o dist/mpv       ./cmd/mpv
-CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o dist/mpv.exe   ./cmd/mpv
+GOOS=windows GOARCH=amd64 go build -o dist/mpv.exe   ./cmd/mpv
 
 # client-side agent — build for whatever the real-mpv machine runs on
-CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o dist/mpv-agent.exe ./cmd/mpv-agent
+GOOS=windows GOARCH=amd64 go build -o dist/mpv-agent.exe ./cmd/mpv-agent
 CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -o dist/mpv-agent     ./cmd/mpv-agent
 ```
 
