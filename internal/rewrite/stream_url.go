@@ -113,9 +113,9 @@ func IsMediaURL(mediaPath string) bool {
 
 // RewriteTorrentStreamURL rewrites a Seanime torrent-stream URL's host.
 // Seanime binds that embedded server to a loopback address, meaningful
-// only on the server's own machine, so this swaps in the server's LAN
-// hostname (from serverBaseURL) while keeping the original port, path
-// and query - including Seanime's own already-valid token - untouched.
+// only on the server's own machine, and its port is the one inside the
+// container, so this swaps in the server's LAN scheme, host and port
+// (from serverBaseURL) while keeping the original path and query - including Seanime's own already-valid token - untouched.
 // title is a display name for mpv's window, derived from the URL path.
 func RewriteTorrentStreamURL(serverBaseURL, mediaURL string) (rewrittenURL, title string, err error) {
 	u, err := url.Parse(mediaURL)
@@ -127,11 +127,8 @@ func RewriteTorrentStreamURL(serverBaseURL, mediaURL string) (rewrittenURL, titl
 		return "", "", fmt.Errorf("rewrite: invalid server base URL %q: %w", serverBaseURL, err)
 	}
 
-	host := base.Hostname()
-	if port := u.Port(); port != "" {
-		host += ":" + port
-	}
-	u.Host = host
+	u.Scheme = base.Scheme
+	u.Host = base.Host
 
 	return u.String(), path.Base(u.Path), nil
 }
