@@ -1,4 +1,4 @@
-module mpvrelay
+module github.com/TheAnnoying/mpvrelay
 
 go 1.23
 

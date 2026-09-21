@@ -17,6 +17,10 @@ a separate desktop machine on the same LAN. It ships as two Go binaries:
   server, and on each session launches real `mpv` there, tunneling its
   actual IPC socket/pipe back over the same TCP connection.
 
+Each binary is a thin wrapper (flags/env parsing only) around an importable
+package holding the real logic: `stub` (server side) and `agent` (client
+side), both exposing `Run`. Module path: `github.com/TheAnnoying/mpvrelay`.
+
 Full design rationale, env vars, deployment steps and known limitations are
 in [README.md](README.md) — read it before making non-trivial changes;
 much of the "why" documented there is not repeated here.
@@ -53,7 +57,7 @@ newline-terminated JSON line; order alone disambiguates the handshake
 from what follows, since it always happens first. After that one
 exchange, the *same* connection becomes a plain newline-delimited relay
 of raw mpv IPC lines — read with a `bufio.Scanner` directly in
-`cmd/mpv`/`cmd/mpv-agent`, the identical pattern already used on the
+`stub`/`agent`, the identical pattern already used on the
 local socket/pipe side. There's no mid-session control channel: a
 session ends when either side closes the connection, and each side logs
 its own reason locally rather than the peer's.
@@ -81,8 +85,8 @@ server's media library:
 
 Every other package treats IPC content as opaque bytes.
 
-**Session lifecycle** (see `cmd/mpv/main.go`'s `run` and
-`cmd/mpv-agent/main.go`'s `runSession`): the stub listens on both the IPC
+**Session lifecycle** (see `stub/stub.go`'s `Run` and
+`agent/agent.go`'s `runSession`): the stub listens on both the IPC
 socket (for Seanime) and a fixed TCP port (for the agent) and accepts
 whichever connects first (`acceptBoth`); the agent is expected to already
 be running and redialing that fixed port on a short interval *before* any
@@ -94,8 +98,8 @@ connection.
 **Critical invariant, no longer test-enforced:** exactly one
 `bufio.Scanner` must be constructed per connection and reused for that
 connection's entire life — including across the handshake and the relay
-loop that follows on the same connection (see `cmd/mpv`'s `agentScanner`
-and `cmd/mpv-agent`'s `scanner` in `runSession`, each created once and
+loop that follows on the same connection (see the `stub` package's `agentScanner`
+and the `agent` package's `scanner` in `runSession`, each created once and
 handed into the goroutine that keeps reading). A second reader built on
 the same `net.Conn` silently drops whatever bytes the first had already
 buffered past its last read — this caused real data loss in earlier

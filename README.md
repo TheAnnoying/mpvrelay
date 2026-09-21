@@ -16,6 +16,12 @@ Two binaries:
   the server, and on each session launches real `mpv` there, tunneling
   its actual IPC socket/pipe back over the same connection.
 
+Each binary is a thin wrapper around an importable package, so a Go app
+can embed either half: `github.com/TheAnnoying/mpvrelay/stub`
+(`stub.Run(args, stub.Config{...})`, server side) and
+`github.com/TheAnnoying/mpvrelay/agent` (`agent.Run(ctx, server, mpvPath)`,
+client side; blocks until `ctx` is cancelled).
+
 Everything in between is relayed byte-for-byte. The only code that ever
 looks inside an IPC line lives in `internal/rewrite`, and it does exactly
 two things (see that package's doc comment for the full reasoning):
@@ -88,7 +94,7 @@ Seanime runs, and the agent runs wherever the real, screen-having mpv is;
 either one can be either OS.
 
 ```sh
-cd tools/mpvrelay
+cd mpvrelay  # repo root
 
 # server-side stub — build for whatever Seanime's own host runs on
 CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -o dist/mpv       ./cmd/mpv
@@ -158,7 +164,7 @@ mpv-agent -server myserver.local:43219 -mpv "C:\Program Files\mpv\mpv.exe"
 Everything else (retry interval, dial/handshake/pipe timeouts) is a fixed
 constant in the code, not something a deployment should need to tune.
 
-The server-side stub (`cmd/mpv`) still takes its configuration from
+The server-side stub binary (`cmd/mpv`) still takes its configuration from
 environment variables — see "Deploying the server-side stub" above,
 including the cmd.exe quoting pitfall that applies there.
 
